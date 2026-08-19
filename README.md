@@ -12,9 +12,9 @@
 
 When enterprises deploy swarms of 50 to 300+ parallel autonomous agents (e.g. processing invoice reconciliations, trading ledgers, or customer checkouts), they encounter severe concurrency breakdowns:
 
-* **Silent Checkpoint State Overwrite:** Parallel agent nodes writing to shared databases simultaneously overwrite state checkpoints without throwing errors (as documented in LangGraph #942 and #1184).
-* **Connection Pool Deadlocks:** 100+ agents querying downstream PostgreSQL databases trigger connection exhaustion and cascading timeouts (LangGraph #7304, CrewAI #831).
-* **Real Financial Damage:** In production invoice processing, a single un-atomic race condition can duplicate a $142,000 disbursement or freeze checkout pipelines during high traffic.
+* **Silent Checkpoint State Overwrite:** Parallel agent nodes writing to shared databases simultaneously overwrite state checkpoints without throwing errors (as documented in LangGraph #8115, PR #8114, and #1184).
+* **Connection Pool Deadlocks & Lock Contention:** 100+ agents querying downstream PostgreSQL/SQLite checkpoints trigger connection exhaustion, instance-level lock contention, and cascading timeouts (LangGraph #7259, #7857, #8136, CrewAI #831).
+* **Real Financial Damage:** In production invoice processing and multi-agent checkouts, an un-atomic TOCTOU race condition duplicates disbursements or causes silent checkpoint drops ($142,000+ per incident).
 
 ---
 
