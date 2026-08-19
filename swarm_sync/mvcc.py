@@ -70,29 +70,38 @@ class MVCCStore:
         with self._lock:
             return Snapshot(self._tx_counter, self)
 
+    def _lookup_locked(self, key: str, tx_id: int) -> Tuple[Optional[Any], int]:
+        """Version lookup assuming `self._lock` is already held by the caller.
+
+        Split out specifically so `_commit_tx` can call it without
+        re-acquiring `self._lock` — it used to call `_get_with_version`
+        (below) from inside its own `with self._lock:` block, and because
+        `threading.Lock` isn't reentrant, that was a guaranteed self-deadlock
+        on the very first commit of any write, every time. Not a race
+        condition; 100% reproducible, caught by actually running the test
+        suite rather than trusting it.
+        """
+        versions = self._records.get(key, [])
+        for v in reversed(versions):
+            if v.created_at_tx <= tx_id:
+                if v.deleted_at_tx is None or v.deleted_at_tx > tx_id:
+                    return v.val, v.created_at_tx
+        return None, 0
+
     def _get_at_version(self, key: str, tx_id: int) -> Optional[Any]:
         with self._lock:
-            versions = self._records.get(key, [])
-            for v in reversed(versions):
-                if v.created_at_tx <= tx_id:
-                    if v.deleted_at_tx is None or v.deleted_at_tx > tx_id:
-                        return v.val
-            return None
+            val, _ = self._lookup_locked(key, tx_id)
+            return val
 
     def _get_with_version(self, key: str, tx_id: int) -> Tuple[Optional[Any], int]:
         with self._lock:
-            versions = self._records.get(key, [])
-            for v in reversed(versions):
-                if v.created_at_tx <= tx_id:
-                    if v.deleted_at_tx is None or v.deleted_at_tx > tx_id:
-                        return v.val, v.created_at_tx
-            return None, 0
+            return self._lookup_locked(key, tx_id)
 
     def _commit_tx(self, tx: Transaction) -> bool:
         with self._lock:
             # 1. Validate Reads (Optimistic Concurrency Control)
             for k, read_ver in tx.reads.items():
-                current_val, current_ver = self._get_with_version(k, self._tx_counter)
+                current_val, current_ver = self._lookup_locked(k, self._tx_counter)
                 if current_ver > read_ver and k not in tx.writes:
                     raise WriteConflictError(
                         f"Conflict on key '{k}': read version {read_ver}, but current version is {current_ver}"
@@ -100,7 +109,7 @@ class MVCCStore:
 
             # 2. Check Write-Write Conflicts
             for k in tx.writes:
-                current_val, current_ver = self._get_with_version(k, self._tx_counter)
+                current_val, current_ver = self._lookup_locked(k, self._tx_counter)
                 if k in tx.reads and current_ver > tx.reads[k]:
                     raise WriteConflictError(
                         f"Write-Write conflict on key '{k}': modified by concurrent transaction"

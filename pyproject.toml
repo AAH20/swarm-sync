@@ -12,17 +12,16 @@ authors = [
 license = { text = "MIT OR Apache-2.0" }
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-    "pydantic>=2.5.0",
-    "typing_extensions>=4.8.0",
-    "anyio>=4.0.0",
-]
+# No third-party runtime dependencies: mvcc.py and mesh.py use only
+# threading/dataclasses/typing from the standard library, and arbiter.py
+# uses only asyncio. An earlier version of this file listed pydantic,
+# typing_extensions, and anyio here — none were ever imported anywhere in
+# the codebase.
+dependencies = []
 
 [project.optional-dependencies]
+# pytest can run this project's unittest-style tests directly; no async
+# tests exist, so pytest-asyncio (previously listed here unused) is gone too.
 dev = [
     "pytest>=7.4.0",
-    "pytest-asyncio>=0.21.0",
 ]
-
-[tool.pytest.ini_options]
-asyncio_mode = "auto"

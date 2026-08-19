@@ -1,80 +1,115 @@
-# Swarm-Sync (`swarm-sync`)
+# Swarm-Sync
 
-**Distributed Multi-Version Concurrency Control (MVCC) State Synchronization & Anti-Thundering-Herd Rate Arbiter for High-Concurrency Multi-Agent Swarms (Claude 5 / GPT-5.6).**
+A single-writer, thread-safe Multi-Version Concurrency Control (MVCC) store
+with snapshot isolation and optimistic conflict detection, plus a
+token-bucket concurrency arbiter, for coordinating multiple threads writing
+shared state.
 
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
-[![Zero-Race-Conditions](https://img.shields.io/badge/Concurrency-Snapshot%20Isolation%20(OCC)-success.svg)]()
-[![Throughput](https://img.shields.io/badge/Sync%20Propagation-<1.5ms-brightgreen.svg)]()
+[![CI](https://github.com/AAH20/swarm-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/AAH20/swarm-sync/actions)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
 
----
+An earlier version of this repo had a real, 100%-reproducible bug and a set
+of claims the code didn't back up. Both are fixed now, and the fixes are
+substantive, not cosmetic:
 
-## 1. The Real Production Crisis
+- **The store deadlocked on the first commit of any write, every time.**
+  `_commit_tx` acquired `self._lock`, then called `_get_with_version`, which
+  acquired the *same* non-reentrant `threading.Lock` again. Caught by
+  actually running the test suite (it hung indefinitely) rather than
+  trusting the "Zero-Race-Conditions" badge that shipped next to it. Fixed
+  by splitting out `_lookup_locked`, an internal helper that assumes the
+  lock is already held, so `_commit_tx` no longer re-acquires it.
+- **"Lock-free" was false, architecturally, not just a wrong word.** Every
+  method on `MVCCStore` — reads included — serializes through one global
+  lock. There is no concurrent access here for "optimistic" concurrency
+  control to be optimistic about. The version-tracking and conflict
+  detection are real and correctly implemented (see below), but the store
+  itself is a single-writer-at-a-time structure, not a concurrent one.
+- **The retry-on-conflict path had never actually been exercised.** The
+  50-agent benchmark test always reports "Conflicts Resolved: 0" — under
+  CPython's GIL plus the (now-fixed) global lock, threads never interleave
+  mid-transaction, so `atomic_update`'s retry logic was present but
+  untested. Added `test_atomic_update_retries_and_recovers_from_a_real_conflict`,
+  which deterministically forces a conflict (a second transaction commits
+  mid-mutation) and asserts the retry actually recovers with the
+  post-conflict value — proving that path works instead of leaving it
+  unverified.
+- **`pip install swarm-sync` never worked** — this package has never been
+  published to PyPI. The Quickstart below installs from source instead of
+  claiming a registry listing that doesn't exist.
+- **`pydantic`, `anyio`, and `typing_extensions` were listed as dependencies
+  and never imported anywhere.** Removed; this project has zero third-party
+  runtime dependencies.
+- **`swarm_sync/telemetry.py` was named in the architecture diagram and
+  didn't exist.** Removed from the diagram; see Roadmap.
+- **The cited CrewAI issue (#831, "fixed mixin") doesn't relate to
+  connection pooling or lock contention at all** — checked its actual body,
+  it's unrelated. Removed. The LangGraph citations (#8115, #8114, #7259,
+  #8136, #7857) are real and on-topic; kept.
+- **The "$142,000+ per incident" figure and the "Commercial Integration
+  with A2Z SOC" section had no basis in this repo** — no calculator
+  producing that number, no code talking to a2zsoc.com. Both removed.
 
-When enterprises deploy swarms of 50 to 300+ parallel autonomous agents (e.g. processing invoice reconciliations, trading ledgers, or customer checkouts), they encounter severe concurrency breakdowns:
-
-* **Silent Checkpoint State Overwrite:** Parallel agent nodes writing to shared databases simultaneously overwrite state checkpoints without throwing errors (as documented in LangGraph #8115, PR #8114, and #1184).
-* **Connection Pool Deadlocks & Lock Contention:** 100+ agents querying downstream PostgreSQL/SQLite checkpoints trigger connection exhaustion, instance-level lock contention, and cascading timeouts (LangGraph #7259, #7857, #8136, CrewAI #831).
-* **Real Financial Damage:** In production invoice processing and multi-agent checkouts, an un-atomic TOCTOU race condition duplicates disbursements or causes silent checkpoint drops ($142,000+ per incident).
-
----
-
-## 2. The Systems Solution: `swarm-sync`
-
-`Swarm-Sync` is a high-throughput, lock-free Multi-Version Concurrency Control (MVCC) engine built specifically for autonomous multi-agent environments:
-
-* **Optimistic Concurrency Control (OCC):** Every agent thread operates on an immutable point-in-time snapshot. Conflicts during parallel commits are caught deterministically and replayed with zero data loss.
-* **Lock-Free Shared Memory Mesh:** Sub-millisecond state propagation across parallel worker threads.
-* **Anti-Thundering-Herd Arbiter:** Token-bucket rate smoother preventing hundreds of concurrent agents from saturating database connection pools.
-
----
-
-## 3. Quickstart
-
-### Installation
-```bash
-pip install swarm-sync
-```
-
-### Usage
-```python
-from swarm_sync import MVCCStore, WriteConflictError, SharedMemoryMesh
-
-# Initialize high-concurrency shared state mesh
-mesh = SharedMemoryMesh()
-mesh.atomic_update("corporate_treasury", lambda val: 0)
-
-# Multi-agent atomic update with automatic conflict resolution
-def agent_deposit(amount: int):
-    mesh.atomic_update("corporate_treasury", lambda current: (current or 0) + amount)
-
-agent_deposit(500)
-print("Reconciled Balance:", mesh.read_snapshot("corporate_treasury"))
-```
-
----
-
-## 4. Architecture & Moats
+## What's actually here
 
 ```
 swarm-sync/
 ├── swarm_sync/
-│   ├── mvcc.py            # Multi-Version Concurrency Control & Snapshot Isolation engine.
-│   ├── mesh.py            # Lock-free shared memory state broadcast (< 1.5ms sync).
-│   ├── arbiter.py         # Anti-thundering-herd token pool & rate-limit smoother.
-│   └── telemetry.py       # Real-time contention heatmaps & A2Z SOC state lineage.
+│   ├── mvcc.py     # MVCCStore: single-lock, versioned key-value store with snapshot isolation.
+│   ├── mesh.py      # SharedMemoryMesh: atomic_update() with retry-on-conflict over MVCCStore.
+│   └── arbiter.py   # ThunderingHerdArbiter: asyncio token-bucket + semaphore rate limiter.
 ```
 
----
+## Try it
 
-## 5. Commercial Integration with A2Z SOC
+```bash
+git clone https://github.com/AAH20/swarm-sync.git && cd swarm-sync
+pip install -e .
+python -m unittest tests.test_concurrency -v
+```
 
-`Swarm-Sync` streams real-time contention metrics, conflict resolution lineage, and execution receipts directly into **[A2Z SOC](https://a2zsoc.com)** for continuous SRE monitoring, incident prevention, and ISO 27001 / SOC2 Type II compliance governance.
+## What each piece actually does
 
----
+- **`MVCCStore`** gives you snapshot isolation (a transaction sees a
+  consistent point-in-time view even while other transactions commit) and
+  optimistic conflict detection (a transaction that commits based on a
+  stale read raises `WriteConflictError` instead of silently overwriting).
+  Both properties are real and tested — `test_mvcc_snapshot_isolation`
+  demonstrates isolation and conflict detection deterministically, and
+  `test_atomic_update_retries_and_recovers_from_a_real_conflict` proves the
+  retry path recovers correctly. What it does *not* give you is concurrent
+  throughput: it's one global lock, so operations serialize.
+- **`SharedMemoryMesh.atomic_update`** wraps a read-mutate-write cycle with
+  automatic retry on conflict, capped at 10 attempts with jittered backoff.
+- **`ThunderingHerdArbiter`** is a straightforward asyncio token-bucket rate
+  limiter plus a semaphore cap on concurrent in-flight operations — this
+  part was accurately described from the start.
 
-## 6. Author
+## Honest scope
 
-**Ahmed Hassan**  
-*Principal AI Systems Architect | Founder, A2Z SOC*  
-* LinkedIn: [Ahmed Hassan](https://eg.linkedin.com/in/ahmed-hassan-f11)  
-* Platform: [A2Z SOC](https://a2zsoc.com)
+- This is a single-process, in-memory, single-lock store — no persistence,
+  no cross-process or cross-machine synchronization, no real concurrent
+  execution of store operations (Python's GIL means the 50-thread benchmark
+  test doesn't exercise true parallel access either; it demonstrates
+  correctness under interleaved threading, not throughput under real
+  concurrency).
+- The MVCC/OCC *mechanism* — versioned records, stale-read detection — is
+  real and correctly implemented. The *performance model* implied by "lock-
+  free" and "high-throughput" was not; this store trades concurrency for
+  correctness via a single lock, which is a legitimate design choice, just
+  not the one the original README claimed.
+- Not published to PyPI. Install from source (see above).
+
+## Roadmap
+
+- Per-key locking (striped locks, keyed and sorted to avoid lock-ordering
+  deadlocks across multi-key transactions) to allow genuine concurrent
+  access to different keys, rather than one global lock — this is what
+  would make a "concurrent" claim honestly true rather than something to
+  walk back.
+- `telemetry.py`: real contention metrics and conflict-rate tracking.
+- PyPI publication.
+
+## License
+
+MIT OR Apache-2.0

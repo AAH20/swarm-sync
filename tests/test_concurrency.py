@@ -30,6 +30,34 @@ class TestSwarmSyncConcurrency(unittest.TestCase):
         with self.assertRaises(WriteConflictError):
             tx1.commit()
 
+    def test_atomic_update_retries_and_recovers_from_a_real_conflict(self):
+        # The 50-agent test below reports "Conflicts Resolved: 0" every time —
+        # under CPython's GIL plus this store's single global lock, threads
+        # never actually interleave mid-transaction, so atomic_update's
+        # retry-on-WriteConflictError path had never been exercised by any
+        # test. This forces a real conflict deterministically: a second,
+        # independent transaction commits and bumps the key's version *while
+        # the first transaction's mutate_fn is still running*, so the first
+        # transaction's commit sees a stale read version and must raise.
+        mesh = SharedMemoryMesh()
+        mesh.atomic_update("k", lambda v: 0)
+
+        calls = {"n": 0}
+
+        def mutate_with_injected_conflict(current):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                interloper = mesh.store.begin()
+                interloper.set("k", 999)
+                interloper.commit()
+            return (current or 0) + 1
+
+        result = mesh.atomic_update("k", mutate_with_injected_conflict)
+
+        self.assertEqual(calls["n"], 2, "mutate_fn must be called again after the forced conflict")
+        self.assertEqual(result, 1000, "the retry must read the post-conflict value (999), not the stale one")
+        self.assertEqual(mesh.conflicts_caught, 1)
+
     def test_50_concurrent_agents_balance_reconciliation(self):
         mesh = SharedMemoryMesh()
         mesh.atomic_update("corporate_treasury", lambda val: 0)
